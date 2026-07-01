@@ -1,15 +1,26 @@
 # Ignore everything by default
 *
 
-# But allow these specific SRE scripts
-!anom_det.py
-!db_audit.py
-!mail_audit.py
-!ask_agent.sh
-!tailscale_sentinelfixed.sh
-!Gamemode.sh
+# Allow the specific tool directories (Required so Git looks inside them)
+!ai_agents/
+!monitoring_telemetry/
+!network_automation/
+!legacy_optimizations/
+
+# Allow your configuration and documentation files
 !.gitignore
 !README.md
+
+# But inside those folders, allow ONLY your specific SRE scripts
+!ai_agents/ask_agent.sh
+!ai_agents/db_audit.py
+
+!monitoring_telemetry/anom_det.py
+!monitoring_telemetry/mail_audit.py
+
+!network_automation/tailscale_sentinelfixed.sh
+
+!legacy_optimizations/Gamemode.sh
 
 # Strictly ignore vim swap files and python caches
 *.swp
