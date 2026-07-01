@@ -1,0 +1,16 @@
+# Ignore everything by default
+*
+
+# But allow these specific SRE scripts
+!anom_det.py
+!db_audit.py
+!mail_audit.py
+!ask_agent.sh
+!tailscale_sentinelfixed.sh
+!Gamemode.sh
+!.gitignore
+!README.md
+
+# Strictly ignore vim swap files and python caches
+*.swp
+__pycache__/
