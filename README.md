@@ -1,6 +1,6 @@
 # SRE Toolkit & Automation Scripts
 
-This repository contains a collection of custom Bash and Python automation scripts designed to monitor, optimize, and orchestrate my personal hybrid-cloud infrastructure (the "Operation Phoenix" cluster). 
+This repository contains a collection of custom Bash and Python automation scripts designed to monitor, optimize, and orchestrate my personal hybrid-cloud infrastructure. 
 
 These tools are built around the core principles of **Site Reliability Engineering (SRE)**: automating manual labor, ensuring high availability, maintaining strict OPSEC, and deploying self-healing diagnostics.
 
