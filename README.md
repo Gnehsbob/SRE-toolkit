@@ -38,5 +38,5 @@ All scripts within this repository have been decoupled from their internal envir
 
 ---
 
-**Author:** [Bokgosi Letebele] | *Systems Administrator & Infrastructure Engineer*  
+**Author:** Bokgosi Letebele | *Systems Administrator & Infrastructure Engineer*  
 **Primary Stack:** RHEL 9 (Rocky), Ubuntu 24.04, Docker, Ansible, KVM/libvirt, WireGuard
