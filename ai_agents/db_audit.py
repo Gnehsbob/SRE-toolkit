@@ -1,28 +1,35 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
-db_audit.py — LLM-in-the-loop slow-query auditor for MariaDB.
+db_audit.py v2 — LLM-in-the-loop slow-query auditor for MariaDB.
+Integrated with ask agent: shares ASK_KNOWLEDGE_PATH and supports --escalate flag.
 
-Reads new entries from the MariaDB slow query log, runs EXPLAIN and
-SHOW CREATE TABLE for the tables involved, then ships the real query +
-execution plan + schema (not just a counter) to Ollama for an index/
-optimization recommendation. Designed for the same node pattern as
-mail_audit.py: run this on whichever box is light, point --ollama-host
-at wherever Ollama actually lives (e.g. the T560 over Tailscale).
+CHANGES FROM v1:
+  - LOG_PATH now reads ASK_KNOWLEDGE_PATH env var (shared KB with ask agent)
+  - Log records include "type": "db_audit" for filtered recall
+  - --escalate flag: on High-impact findings, prints escalation string to stdout
+  - STATE_PATH unchanged (separate state tracking file, not part of shared KB)
 
 Prerequisites:
-    1. Slow query log enabled in MariaDB (see SET GLOBAL slow_query_log etc.)
-    2. A read-only DB user's credentials in ~/.my.cnf (chmod 600), e.g.:
+    1. slow_query_log enabled:
+         sudo mariadb -e "SET GLOBAL slow_query_log = 'ON';"
+         sudo mariadb -e "SET GLOBAL long_query_time = 0.5;"
+         sudo mariadb -e "SET GLOBAL log_queries_not_using_indexes = 'ON';"
+    2. Read-only monitoring credentials in ~/.my.cnf (chmod 600):
          [client]
          user=aiops_monitor
-         password=...
+         password=********
+    3. Run WITHOUT sudo — sudo resolves $HOME as /root, breaking ~/.my.cnf lookup
 
 Usage:
-    python3 db_audit.py --once --slow-log-path /var/log/mariadb/mariadb-slow.log
+    python3 db_audit.py --once
+    python3 db_audit.py --once --escalate
     python3 db_audit.py --loop --interval 300
 """
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -34,22 +41,27 @@ from pathlib import Path
 # Configuration
 # --------------------------------------------------------------------------
 
-DEFAULT_OLLAMA_HOST = "http://localhost:11434"
-DEFAULT_MODEL = "llama3.1"
-DEFAULT_SLOW_LOG_PATH = Path("/var/log/mariadb/mariadb-slow.log")
-DEFAULT_STATE_PATH = Path.home() / "services" / "db_audit_state.json"
-DEFAULT_LOG_PATH = Path.home() / "services" / "db_audit_log.jsonl"
-DEFAULT_MY_CNF = Path.home() / ".my.cnf"
-MAX_QUERIES_PER_RUN = 10  # cap LLM calls per pass even if log has more
+DEFAULT_OLLAMA_HOST = "http://[HOSTNAME]:11434"
+DEFAULT_MODEL       = "llama3.2:3b"
+DEFAULT_SLOW_LOG    = Path("/var/lib/mysql/[HOSTNAME]-slow.log")
+DEFAULT_STATE_PATH  = Path.home() / "services" / "db_audit_state.json"
+DEFAULT_MY_CNF      = Path.home() / ".my.cnf"
+MAX_QUERIES_PER_RUN = 10
 
-# --------------------------------------------------------------------------
-# Secret redaction (same approach as mail_audit.py)
-# --------------------------------------------------------------------------
-
-_SENSITIVE_KV = re.compile(
-    r"(?i)\b(pass(word)?|secret|api[_-]?key|token)\b\s*[:=]\s*\S+"
+# INTEGRATION: reads from ASK_KNOWLEDGE_PATH env var — shared KB with ask agent
+DEFAULT_LOG_PATH = Path(
+    os.environ.get(
+        "ASK_KNOWLEDGE_PATH",
+        str(Path.home() / "services" / "db_audit_log.jsonl")
+    )
 )
-_LONG_TOKEN = re.compile(r"\b[A-Za-z0-9+/_-]{32,}\b")
+
+# --------------------------------------------------------------------------
+# Secret redaction
+# --------------------------------------------------------------------------
+
+_SENSITIVE_KV = re.compile(r"(?i)\b(pass(word)?|secret|api[_-]?key|token)\b\s*[:=]\s*\S+")
+_LONG_TOKEN   = re.compile(r"\b[A-Za-z0-9+/_-]{32,}\b")
 
 
 def redact(text: str) -> str:
@@ -59,28 +71,21 @@ def redact(text: str) -> str:
 
 
 # --------------------------------------------------------------------------
-# MySQL/MariaDB client helpers
+# MariaDB helpers
 # --------------------------------------------------------------------------
 
 def run_mysql(my_cnf: Path, sql: str, timeout: int = 15) -> tuple[int, str, str]:
-    cmd = [
-        "mysql",
-        f"--defaults-extra-file={my_cnf}",
-        "-N",  # skip column header
-        "-e", sql,
-    ]
+    cmd = ["mysql", f"--defaults-extra-file={my_cnf}", "-N", "-e", sql]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
     except FileNotFoundError:
         return 127, "", "mysql client not found on PATH"
     except subprocess.TimeoutExpired:
-        return 124, "", f"timed out running: {sql[:80]}"
+        return 124, "", f"timed out: {sql[:80]}"
 
 
-from typing import Optional
-
-def get_slow_query_count(my_cnf: Path) -> Optional[int]:
+def get_slow_query_count(my_cnf: Path) -> int | None:
     rc, out, _ = run_mysql(my_cnf, "SHOW GLOBAL STATUS LIKE 'Slow_queries';")
     if rc != 0 or not out:
         return None
@@ -93,27 +98,21 @@ def get_slow_query_count(my_cnf: Path) -> Optional[int]:
 def run_explain(my_cnf: Path, sql_text: str) -> str:
     cleaned = sql_text.strip().rstrip(";")
     rc, out, err = run_mysql(my_cnf, f"EXPLAIN {cleaned};")
-    if rc != 0:
-        return f"[EXPLAIN failed: {redact(err)}]"
-    return out
+    return out if rc == 0 else f"[EXPLAIN failed: {redact(err)}]"
 
 
 def show_create_table(my_cnf: Path, table: str) -> str:
-    # Basic guard against accidental injection via a malformed table name
     if not re.match(r"^[A-Za-z0-9_]+$", table):
         return f"[skipped: unsafe table name '{table}']"
     rc, out, err = run_mysql(my_cnf, f"SHOW CREATE TABLE `{table}`;")
-    if rc != 0:
-        return f"[SHOW CREATE TABLE failed: {redact(err)}]"
-    return out
+    return out if rc == 0 else f"[SHOW CREATE TABLE failed: {redact(err)}]"
 
 
 _TABLE_REF = re.compile(r"(?i)\b(?:FROM|JOIN)\s+`?([A-Za-z0-9_]+)`?")
 
 
 def extract_tables(sql_text: str) -> list[str]:
-    found = {m.group(1) for m in _TABLE_REF.finditer(sql_text)}
-    return sorted(found)
+    return sorted({m.group(1) for m in _TABLE_REF.finditer(sql_text)})
 
 
 # --------------------------------------------------------------------------
@@ -125,14 +124,12 @@ _QUERY_TIME_RE = re.compile(
 )
 
 
-from typing import Tuple
-
-def read_new_log_bytes(log_path: Path, last_offset: int) -> Tuple[str, int]:
+def read_new_log_bytes(log_path: Path, last_offset: int) -> tuple[str, int]:
     if not log_path.exists():
         return "", last_offset
     size = log_path.stat().st_size
     if size < last_offset:
-        last_offset = 0  # log was rotated/truncated
+        last_offset = 0
     with log_path.open("r", errors="replace") as f:
         f.seek(last_offset)
         data = f.read()
@@ -140,14 +137,13 @@ def read_new_log_bytes(log_path: Path, last_offset: int) -> Tuple[str, int]:
 
 
 def parse_slow_log(text: str) -> list[dict]:
-    """Split the slow log into per-query records and pull out metrics + SQL."""
     entries = []
-    blocks = re.split(r"(?=^# Time: )", text, flags=re.MULTILINE)
+    blocks  = re.split(r"(?=^# Time: )", text, flags=re.MULTILINE)
     for block in blocks:
         m = _QUERY_TIME_RE.search(block)
         if not m:
             continue
-        lines = block.splitlines()
+        lines    = block.splitlines()
         sql_lines = [
             ln for ln in lines
             if ln.strip()
@@ -159,17 +155,16 @@ def parse_slow_log(text: str) -> list[dict]:
         if not sql_text:
             continue
         entries.append({
-            "query_time": float(m.group(1)),
-            "lock_time": float(m.group(2)),
-            "rows_sent": int(m.group(3)),
-            "rows_examined": int(m.group(4)),
-            "sql": redact(sql_text),
+            "query_time":     float(m.group(1)),
+            "lock_time":      float(m.group(2)),
+            "rows_sent":      int(m.group(3)),
+            "rows_examined":  int(m.group(4)),
+            "sql":            redact(sql_text),
         })
     return entries
 
 
 def normalize_signature(sql_text: str) -> str:
-    """Collapse literals so repeated identical-shape queries dedupe together."""
     sig = re.sub(r"'[^']*'", "?", sql_text)
     sig = re.sub(r"\b\d+\b", "?", sig)
     return re.sub(r"\s+", " ", sig).strip().lower()
@@ -183,8 +178,7 @@ def dedupe_entries(entries: list[dict]) -> list[dict]:
             grouped[sig] = {**e, "occurrences": 1}
         else:
             grouped[sig]["occurrences"] += 1
-            grouped[sig]["query_time"] = max(grouped[sig]["query_time"], e["query_time"])
-    # Worst offenders first
+            grouped[sig]["query_time"]   = max(grouped[sig]["query_time"], e["query_time"])
     return sorted(grouped.values(), key=lambda e: e["query_time"], reverse=True)
 
 
@@ -192,31 +186,28 @@ def dedupe_entries(entries: list[dict]) -> list[dict]:
 # Ollama query
 # --------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are a Database Administrator analyzing slow queries on a MariaDB
-server backing a financial backtesting application. You will receive a JSON object
-containing: the slow query text, its execution metrics (query_time, lock_time,
-rows_sent, rows_examined, occurrences), the EXPLAIN plan, and CREATE TABLE statements
-for the tables involved.
+SYSTEM_PROMPT = """You are a Database Administrator analyzing slow queries on a MariaDB server.
+You will receive a JSON object containing: the slow query text, execution metrics
+(query_time, lock_time, rows_sent, rows_examined, occurrences), the EXPLAIN plan,
+and CREATE TABLE statements for the tables involved.
 
-A large gap between rows_examined and rows_sent, or an EXPLAIN plan showing type ALL
-on a sizeable table, generally indicates a missing or unused index.
+A large gap between rows_examined and rows_sent, or EXPLAIN showing type=ALL on a
+sizeable table, indicates a missing or unused index.
 
-Respond with ONLY a single JSON object, no markdown fences, no commentary, in this
-exact shape:
+Respond with ONLY a single JSON object, no markdown fences:
 {
-  "missing_index_suggestion": "<a CREATE INDEX statement, or 'none' if no index would help>",
-  "rationale": "<short technical explanation grounded in the EXPLAIN output and schema>",
+  "missing_index_suggestion": "<CREATE INDEX statement, or 'none'>",
+  "rationale": "<short technical explanation grounded in EXPLAIN and schema>",
   "estimated_impact": "Low" | "Medium" | "High",
   "alternative_optimization": "<query rewrite or config suggestion, or 'none'>"
 }"""
 
 
 def query_ollama(payload: dict, host: str, model: str) -> dict:
-    import urllib.request
-    import urllib.error
+    import urllib.request, urllib.error
 
     body = {
-        "model": model,
+        "model":  model,
         "system": SYSTEM_PROMPT,
         "prompt": json.dumps(payload, indent=2),
         "stream": False,
@@ -224,157 +215,200 @@ def query_ollama(payload: dict, host: str, model: str) -> dict:
     }
     req = urllib.request.Request(
         f"{host}/api/generate",
-        data=json.dumps(body).encode("utf-8"),
+        data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            resp_body = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-                return {
-            "status": "error",
-            "confidence": 0,
-            "root_cause": f"ollama_unreachable: {exc}",
-            "suggested_action": "check Tailscale connectivity to the Ollama host"
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            resp_body = json.loads(resp.read().decode())
+    except Exception as exc:
+        return {
+            "missing_index_suggestion": "unknown",
+            "rationale":                f"ollama_unreachable: {exc}",
+            "estimated_impact":         "Low",
+            "alternative_optimization": "none",
         }
 
+    raw = resp_body.get("response", "")
+    cleaned = raw.strip().strip("`")
+    if cleaned.lower().startswith("json"):
+        cleaned = cleaned[4:].strip()
     try:
-        raw_text = resp_body.get("response", "").strip()
-        return json.loads(raw_text)
+        verdict = json.loads(cleaned)
+        verdict["_raw"] = raw
+        return verdict
     except json.JSONDecodeError:
         return {
-            "status": "error",
-            "confidence": 0,
-            "root_cause": "malformed_llm_json",
-            "raw_response": redact(resp_body.get("response", ""))
+            "missing_index_suggestion": "unknown",
+            "rationale":                "model_response_unparseable",
+            "estimated_impact":         "Low",
+            "alternative_optimization": "none",
+            "_raw":                     raw,
         }
 
 
 # --------------------------------------------------------------------------
-# Main audit run loop
+# Logging — shared KB format
 # --------------------------------------------------------------------------
 
-def run_pass(args) -> int:
-    my_cnf = Path(args.my_cnf)
-    slow_log = Path(args.slow_log_path)
-    state_path = Path(args.state_path)
-    log_path = Path(args.log_path)
-
-    # 1. Read last processed offset position
-    last_offset = 0
+def load_state(state_path: Path) -> dict:
     if state_path.exists():
         try:
-            state = json.loads(state_path.read_text())
-            last_offset = state.get("last_offset", 0)
+            return json.loads(state_path.read_text())
         except json.JSONDecodeError:
             pass
+    return {"last_offset": 0, "last_slow_query_count": None}
 
-    # 2. Extract unread raw log data
-    raw_data, current_size = read_new_log_bytes(slow_log, last_offset)
-    
-    # Write down updated offset state immediately
+
+def save_state(state_path: Path, state: dict) -> None:
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps({"last_offset": current_size}))
+    state_path.write_text(json.dumps(state))
 
-    if not raw_data.strip():
+
+def append_log(query_payload: dict, verdict: dict, log_path: Path) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    # INTEGRATION: "type" field + shared input/response schema
+    record = {
+        "timestamp": query_payload["timestamp"],
+        "type":      "db_audit",
+        "hostname":  subprocess.getoutput("hostname"),
+        "model":     DEFAULT_MODEL,
+        "input":     f"db_audit: slow query rows_examined={query_payload.get('rows_examined')} — {query_payload.get('sql','')[:120]}",
+        "response":  verdict.get("missing_index_suggestion", "none"),
+        "verdict":   {k: v for k, v in verdict.items() if k != "_raw"},
+        "query":     query_payload,
+        "model_raw_response": verdict.get("_raw"),
+        "ground_truth_label": None,
+    }
+    with log_path.open("a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+# --------------------------------------------------------------------------
+# Escalation output — designed to be piped into ask
+# --------------------------------------------------------------------------
+
+def escalation_string(entry: dict, verdict: dict) -> str:
+    """
+    Formats a rich, keyword-dense summary for the orchestrator to pipe to ask.
+    MariaDB keywords in the string trigger llama3.2:3b routing automatically.
+    """
+    return (
+        f"[db_audit escalation] IMPACT={verdict.get('estimated_impact','?').upper()} "
+        f"QUERY_TIME={entry.get('query_time','?')}s "
+        f"ROWS_EXAMINED={entry.get('rows_examined','?')} "
+        f"ROWS_SENT={entry.get('rows_sent','?')} "
+        f"OCCURRENCES={entry.get('occurrences','?')} "
+        f"SQL={entry.get('sql','')[:150]} "
+        f"SUGGESTION={verdict.get('missing_index_suggestion','none')} "
+        f"RATIONALE={verdict.get('rationale','n/a')} "
+        f"HOST={subprocess.getoutput('hostname')} "
+        f"MariaDB database slow-query index missing"
+    )
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+def run_once(args) -> int:
+    state = load_state(args.state_path)
+
+    current_count = get_slow_query_count(args.my_cnf)
+    if current_count is not None and state.get("last_slow_query_count") is not None:
+        delta = current_count - state["last_slow_query_count"]
+    else:
+        delta = None
+    state["last_slow_query_count"] = current_count
+
+    raw_text, new_offset = read_new_log_bytes(args.slow_log_path, state["last_offset"])
+    state["last_offset"] = new_offset
+    save_state(args.state_path, state)
+
+    if not raw_text.strip():
+        if not args.quiet:
+            print(f"[{datetime.now(timezone.utc).isoformat()}] no new slow-log entries "
+                  f"(Slow_queries delta: {delta})")
         return 0
 
-    # 3. Parse out, clean up, and deduplicate queries
-    entries = parse_slow_log(raw_data)
-    deduped = dedupe_entries(entries)
-    
-    processed_count = 0
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    entries = dedupe_entries(parse_slow_log(raw_text))[:MAX_QUERIES_PER_RUN]
+    if not entries:
+        return 0
 
-    with log_path.open("a", encoding="utf-8") as out_f:
-        for idx, item in enumerate(deduped):
-            if idx >= MAX_QUERIES_PER_RUN:
-                break
-            
-            # 4. Gather execution blueprints (EXPLAIN & CREATE TABLE)
-            tables = extract_tables(item["sql"])
-            explain_output = run_explain(my_cnf, item["sql"])
-            
-            schemas = {}
-            for t in tables:
-                schemas[t] = show_create_table(my_cnf, t)
+    worst_impact = "Low"
+    escalations  = []
 
-            # Assemble structured audit packet for Ollama context injection
-            payload = {
-                "metrics": {
-                    "query_time_max_sec": item["query_time"],
-                    "lock_time_sec": item["lock_time"],
-                    "rows_sent": item["rows_sent"],
-                    "rows_examined": item["rows_examined"],
-                    "occurrences": item["occurrences"]
-                },
-                "sql": item["sql"],
-                "explain_plan": explain_output,
-                "table_schemas": schemas
-            }
+    for entry in entries:
+        tables         = extract_tables(entry["sql"])
+        schemas        = {t: redact(show_create_table(args.my_cnf, t)) for t in tables}
+        explain_output = redact(run_explain(args.my_cnf, entry["sql"]))
 
-            # 5. Query Ollama for automated optimization schema ideas
-            analysis = query_ollama(payload, args.ollama_host, args.model)
+        payload = {
+            "timestamp":    datetime.now(timezone.utc).isoformat(),
+            "query_time":   entry["query_time"],
+            "lock_time":    entry["lock_time"],
+            "rows_sent":    entry["rows_sent"],
+            "rows_examined":entry["rows_examined"],
+            "occurrences":  entry["occurrences"],
+            "sql":          entry["sql"],
+            "explain":      explain_output,
+            "table_schemas":schemas,
+        }
 
-            # Generate final combined audit record
-            audit_record = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "query_signature": normalize_signature(item["sql"]),
-                "analysis": analysis,
-                "context": payload
-            }
-            
-            out_f.write(json.dumps(audit_record) + "\n")
-            processed_count += 1
-            
-            # Print analysis directly onto stdout for active CLI tracking
-            print(f"[{audit_record['timestamp']}] processed query {idx+1}/{len(deduped)}")
-            print(json.dumps(analysis, indent=2))
-            print("-" * 60)
+        verdict = query_ollama(payload, args.ollama_host, args.model)
+        append_log(payload, verdict, args.log_path)
 
-    return processed_count
+        impact     = verdict.get("estimated_impact", "Low")
+        suggestion = verdict.get("missing_index_suggestion", "none")
 
+        if not args.quiet:
+            print(f"[{payload['timestamp']}] query_time={entry['query_time']}s "
+                  f"rows_examined={entry['rows_examined']} "
+                  f"occurrences={entry['occurrences']} impact={impact}")
+            print(f"    suggestion: {suggestion}")
 
-# --------------------------------------------------------------------------
-# CLI Engine
-# --------------------------------------------------------------------------
+        if impact == "High":
+            worst_impact = "High"
+            escalations.append(escalation_string(entry, verdict))
+        elif impact == "Medium" and worst_impact != "High":
+            worst_impact = "Medium"
+            escalations.append(escalation_string(entry, verdict))
+
+    # INTEGRATION: --escalate prints escalation strings to stdout
+    if args.escalate and escalations:
+        for esc in escalations:
+            print(esc)
+
+    return {"Low": 0, "Medium": 1, "High": 2}[worst_impact]
+
 
 def main():
-    parser = argparse.ArgumentParser(description="MariaDB LLM Slow-Query Auditor")
-    parser.add_argument("--once", action="store_true", help="Run once against new logs and exit.")
-    parser.add_argument("--loop", action="store_true", help="Continuously tail the slow log file.")
-    parser.add_argument("--interval", type=int, default=300, help="Seconds to sleep between loop iterations.")
-    parser.add_argument("--ollama-host", default=DEFAULT_OLLAMA_HOST, help="Ollama listen address.")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="Target LLM model to request recommendations from.")
-    
-    # Configured to look inside /var/lib/mysql/xor-slow.log based on your system configuration discovery
-    parser.add_argument("--slow-log-path", default="/var/lib/mysql/xor-slow.log", help="Path to MariaDB slow query log.")
-    parser.add_argument("--my-cnf", default=str(DEFAULT_MY_CNF), help="Path to config containing credentials.")
-    parser.add_argument("--state-path", default=str(DEFAULT_STATE_PATH), help="State tracking JSON path.")
-    parser.add_argument("--log_path", default=str(DEFAULT_LOG_PATH), help="Audit ledger tracking output destination.")
-
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--once",          action="store_true")
+    parser.add_argument("--loop",          action="store_true")
+    parser.add_argument("--interval",      type=int, default=300)
+    parser.add_argument("--ollama-host",   default=DEFAULT_OLLAMA_HOST)
+    parser.add_argument("--model",         default=DEFAULT_MODEL)
+    parser.add_argument("--slow-log-path", type=Path, default=DEFAULT_SLOW_LOG)
+    parser.add_argument("--state-path",    type=Path, default=DEFAULT_STATE_PATH)
+    parser.add_argument("--log-path",      type=Path, default=DEFAULT_LOG_PATH)
+    parser.add_argument("--my-cnf",        type=Path, default=DEFAULT_MY_CNF)
+    parser.add_argument("--quiet",         action="store_true")
+    # INTEGRATION: escalation flag
+    parser.add_argument("--escalate",      action="store_true",
+                        help="On High/Medium impact, print escalation string to stdout for piping to ask")
     args = parser.parse_args()
 
     if not args.once and not args.loop:
-        print("Error: You must specify either --once or --loop to execute this auditor configuration script.")
-        parser.print_help()
-        sys.exit(1)
+        args.once = True
 
-    if args.once:
-        print(f"Starting single database audit sweep across log path: {args.slow_log_path}")
-        count = run_pass(args)
-        print(f"Sweep finished. Processed {count} unique slow-query structures.")
-    
-    elif args.loop:
-        print(f"Auditor actively watching slow log file: {args.slow_log_path} every {args.interval}s...")
-        try:
-            while True:
-                run_pass(args)
-                time.sleep(args.interval)
-        except KeyboardInterrupt:
-            print("\nShutting down audit monitoring loop smoothly. Exiting.")
+    if args.loop:
+        while True:
+            run_once(args)
+            time.sleep(args.interval)
+    else:
+        sys.exit(run_once(args))
 
 
 if __name__ == "__main__":
     main()
-
